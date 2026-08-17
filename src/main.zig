@@ -44,6 +44,7 @@ fn repl(init: std.process.Init) !void {
                 LexError.Overflow => stderr.writeAll("The number was too big to store.\n"),
                 LexError.OutOfMemory => stderr.writeAll("The token list ran out of memory.\n"),
                 LexError.NegativeWithoutNumber => stderr.writeAll("The '-' symbol must be immediately followed by a number.\n"),
+                LexError.DecimalPointWithoutNumber => stderr.writeAll("The floating number must have at least 1 number after '.'\n"),
             };
             try stderr.flush();
             continue :loop;
@@ -58,6 +59,9 @@ fn repl(init: std.process.Init) !void {
                     EvalError.StackUnderflow => stderr.writeAll("Stack underflow. Not enough arguments for the operation.\n"),
                     EvalError.OutOfMemory => stderr.writeAll("Stack has ran out of memory.\n"),
                     EvalError.WriteFailed => stderr.writeAll("Unable to write to stdout.\n"),
+                    EvalError.ArithmeticWithNoNumber => stderr.writeAll("Unable to use arithmetic commands with non-number arguments.\n"),
+                    EvalError.OverflowOnCommand => stderr.writeAll("Number overflowed on command.\n"),
+                    EvalError.InvalidFloat => stderr.writeAll("Command resulted in unrepresentable floating point number.\n"),
                     EvalError.Quit => break :loop,
                 };
                 try stderr.flush();

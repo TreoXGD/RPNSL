@@ -5,10 +5,33 @@ const Aligned = std.array_list.Aligned;
 
 const tok = @import("./token.zig");
 const Token = tok.Token;
+const OpType = tok.OpType;
 
-pub const EvalError = error{ StackUnderflow, DivisionByZero, WriteFailed, Quit } || Allocator.Error;
+pub const EvalError = error{
+    StackUnderflow,
+    DivisionByZero,
+    WriteFailed,
+    ArithmeticWithNoNumber,
+    OverflowOnCommand,
+    InvalidFloat,
+    Quit,
+} || Allocator.Error;
 
-pub const Stack = Aligned(i32, null);
+pub const Value = union(enum) {
+    int: i32,
+    float: f64,
+    bool: bool,
+
+    pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try switch (self) {
+            .int => |i| writer.print("{d}", .{i}),
+            .float => |f| if (f == @floor(f)) writer.print("{d:.1}", .{f}) else writer.print("{d}", .{f}),
+            .bool => |b| writer.print("{}", .{b}),
+        };
+    }
+};
+
+pub const Stack = Aligned(Value, null);
 
 pub const Interpreter = struct {
     arena: Allocator,
@@ -24,34 +47,17 @@ pub const Interpreter = struct {
 
     pub fn eval(self: *Interpreter, token: Token) EvalError!void {
         switch (token) {
-            .num => try self.stack.append(self.arena, token.num),
+            .int => |i| try self.stack.append(self.arena, .{ .int = i }),
+            .float => |f| try self.stack.append(self.arena, .{ .float = f }),
+            .bool => |b| try self.stack.append(self.arena, .{ .bool = b }),
             .op => |op| {
                 switch (op) {
-                    // tertiary operations
-                    .rot => {
-                        const top = try self.popOrError();
-                        const middle = try self.popOrError();
-                        const bottom = try self.popOrError();
-
-                        try self.stack.append(self.arena, middle);
-                        try self.stack.append(self.arena, top);
-                        try self.stack.append(self.arena, bottom);
-                    },
-                    // binary operations with return
+                    // binary arithmetic operations
                     .add, .sub, .mul, .div, .mod, .min, .max => {
-                        const rhs = try self.popOrError();
-                        const lhs = try self.popOrError();
+                        const rhs = try isNumber(try self.popOrError());
+                        const lhs = try isNumber(try self.popOrError());
 
-                        const result: i32 = switch (op) {
-                            .add => lhs + rhs,
-                            .sub => lhs - rhs,
-                            .mul => lhs * rhs,
-                            .div => if (rhs == 0) return EvalError.DivisionByZero else @divTrunc(lhs, rhs),
-                            .mod => if (rhs == 0) return EvalError.DivisionByZero else @rem(lhs, rhs),
-                            .min => @min(lhs, rhs),
-                            .max => @max(lhs, rhs),
-                            else => unreachable,
-                        };
+                        const result = try computeBin(op, lhs, rhs);
 
                         try self.stack.append(self.arena, result);
                     },
@@ -70,13 +76,9 @@ pub const Interpreter = struct {
                     },
                     // unary operations with return
                     .neg, .abs => {
-                        const num = try self.popOrError();
+                        const num = try isNumber(try self.popOrError());
 
-                        const result: i32 = switch (op) {
-                            .neg => -num,
-                            .abs => if (num < 0) -num else num,
-                            else => unreachable,
-                        };
+                        const result = try computeUnary(op, num);
 
                         try self.stack.append(self.arena, result);
                     },
@@ -87,17 +89,27 @@ pub const Interpreter = struct {
                         try self.stack.append(self.arena, num);
                         try self.stack.append(self.arena, num);
                     },
-                    .drop => _ = try self.popOrError(),
-                    .print => try self.writer.print("> {}\n", .{try self.popOrError()}),
-                    .peek => try self.writer.print("| {}\n", .{try self.peekAtOrError(0)}),
+                    // tertiary operations
+                    .rot => {
+                        const top = try self.popOrError();
+                        const middle = try self.popOrError();
+                        const bottom = try self.popOrError();
+
+                        try self.stack.append(self.arena, middle);
+                        try self.stack.append(self.arena, top);
+                        try self.stack.append(self.arena, bottom);
+                    },
                     // no argument operations
+                    .drop => _ = try self.popOrError(),
+                    .print => try self.writer.print("> {f}\n", .{try self.popOrError()}),
+                    .peek => try self.writer.print("| {f}\n", .{try self.peekAtOrError(0)}),
                     .clear => self.stack.clearRetainingCapacity(),
                     .stack => {
                         if (self.stack.items.len == 0) {
                             try self.writer.writeAll("|\n");
                         } else {
                             var i = self.stack.items.len;
-                            while (i > 0) : (i -= 1) try self.writer.print("| {}\n", .{self.stack.items[i - 1]});
+                            while (i > 0) : (i -= 1) try self.writer.print("| {f}\n", .{self.stack.items[i - 1]});
                         }
                     },
                     .quit => return EvalError.Quit,
@@ -133,12 +145,80 @@ pub const Interpreter = struct {
         }
     }
 
-    fn peekAtOrError(self: *Interpreter, depth: usize) EvalError!i32 {
+    // checks if the given value is of a numeric type
+    fn isNumber(val: Value) EvalError!Value {
+        switch (val) {
+            .int, .float => return val,
+            else => return EvalError.ArithmeticWithNoNumber,
+        }
+    }
+
+    // checks the types of both lhs and rhs. calls numOp afterwards
+    fn computeBin(op: OpType, lhs: Value, rhs: Value) EvalError!Value {
+        if (lhs == .int and rhs == .int) return .{ .int = try numOp(i32, op, lhs.int, rhs.int) };
+
+        const lf: f64 = if (lhs == .int) @floatFromInt(lhs.int) else lhs.float;
+        const rf: f64 = if (rhs == .int) @floatFromInt(rhs.int) else rhs.float;
+
+        const res = try numOp(f64, op, lf, rf);
+        if (std.math.isInf(res) or std.math.isNan(res)) return EvalError.InvalidFloat;
+        return .{ .float = res };
+    }
+
+    fn computeUnary(op: OpType, rhs: Value) EvalError!Value {
+        // does not need a separate function because only one argument needs to have type checked
+        return blk: switch (op) {
+            .neg => if (rhs == .int) {
+                const res = @subWithOverflow(0, rhs.int);
+                if (res[1] != 0) return EvalError.OverflowOnCommand;
+                break :blk .{ .int = res[0] };
+            } else .{ .float = -rhs.float },
+            .abs => if (rhs == .int) {
+                if (rhs.int == std.math.minInt(i32)) return EvalError.OverflowOnCommand;
+                break :blk .{ .int = if (rhs.int < 0) -rhs.int else rhs.int };
+            } else .{ .float = @abs(rhs.float) },
+            else => unreachable,
+        };
+    }
+
+    // finds the result of 'lhs op rhs' expression and returns it with same type as the arguments
+    fn numOp(T: type, op: OpType, lhs: T, rhs: T) EvalError!T {
+        return blk: switch (op) {
+            .add => if (T == i32) {
+                const res = @addWithOverflow(lhs, rhs);
+                if (res[1] != 0) return EvalError.OverflowOnCommand;
+                break :blk res[0];
+            } else lhs + rhs,
+            .sub => if (T == i32) {
+                const res = @subWithOverflow(lhs, rhs);
+                if (res[1] != 0) return EvalError.OverflowOnCommand;
+                break :blk res[0];
+            } else lhs - rhs,
+            .mul => if (T == i32) {
+                const res = @mulWithOverflow(lhs, rhs);
+                if (res[1] != 0) return EvalError.OverflowOnCommand;
+                break :blk res[0];
+            } else lhs * rhs,
+            .div => {
+                if (rhs == 0) return EvalError.DivisionByZero;
+                break :blk if (T == i32) @divTrunc(lhs, rhs) else lhs / rhs;
+            },
+            .mod => {
+                if (rhs == 0) return EvalError.DivisionByZero;
+                break :blk @rem(lhs, rhs);
+            },
+            .min => @min(lhs, rhs),
+            .max => @max(lhs, rhs),
+            else => unreachable,
+        };
+    }
+
+    fn peekAtOrError(self: *Interpreter, depth: usize) EvalError!Value {
         if (depth >= self.stack.items.len) return EvalError.StackUnderflow;
         return self.stack.items[self.stack.items.len - 1 - depth];
     }
 
-    fn popOrError(self: *Interpreter) EvalError!i32 {
+    fn popOrError(self: *Interpreter) EvalError!Value {
         return self.stack.pop() orelse return EvalError.StackUnderflow;
     }
 };
@@ -149,12 +229,12 @@ test "rot operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 1 });
-    try interp.eval(.{ .num = 2 });
-    try interp.eval(.{ .num = 3 });
+    try interp.eval(.{ .int = 1 });
+    try interp.eval(.{ .int = 2 });
+    try interp.eval(.{ .int = 3 });
     try interp.eval(.{ .op = .rot });
 
-    try std.testing.expectEqualSlices(i32, &.{ 2, 3, 1 }, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{ .{ .int = 2 }, .{ .int = 3 }, .{ .int = 1 } }, interp.stack.items);
 }
 
 test "add operation" {
@@ -163,11 +243,11 @@ test "add operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 2 });
-    try interp.eval(.{ .num = 3 });
+    try interp.eval(.{ .int = 2 });
+    try interp.eval(.{ .int = 3 });
     try interp.eval(.{ .op = .add });
 
-    try std.testing.expectEqualSlices(i32, &.{5}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 5 }}, interp.stack.items);
 }
 
 test "sub operation" {
@@ -176,11 +256,11 @@ test "sub operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 10 });
-    try interp.eval(.{ .num = 3 });
+    try interp.eval(.{ .int = 10 });
+    try interp.eval(.{ .int = 3 });
     try interp.eval(.{ .op = .sub });
 
-    try std.testing.expectEqualSlices(i32, &.{7}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 7 }}, interp.stack.items);
 }
 
 test "mul operation" {
@@ -189,11 +269,11 @@ test "mul operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 4 });
-    try interp.eval(.{ .num = 5 });
+    try interp.eval(.{ .int = 4 });
+    try interp.eval(.{ .int = 5 });
     try interp.eval(.{ .op = .mul });
 
-    try std.testing.expectEqualSlices(i32, &.{20}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 20 }}, interp.stack.items);
 }
 
 test "div operation" {
@@ -202,11 +282,11 @@ test "div operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 20 });
-    try interp.eval(.{ .num = 4 });
+    try interp.eval(.{ .int = 20 });
+    try interp.eval(.{ .int = 4 });
     try interp.eval(.{ .op = .div });
 
-    try std.testing.expectEqualSlices(i32, &.{5}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 5 }}, interp.stack.items);
 }
 
 test "div operation with division by zero" {
@@ -215,8 +295,8 @@ test "div operation with division by zero" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 5 });
-    try interp.eval(.{ .num = 0 });
+    try interp.eval(.{ .int = 5 });
+    try interp.eval(.{ .int = 0 });
 
     try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .div }));
 }
@@ -227,11 +307,11 @@ test "mod operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = -7 });
-    try interp.eval(.{ .num = 3 });
+    try interp.eval(.{ .int = -7 });
+    try interp.eval(.{ .int = 3 });
     try interp.eval(.{ .op = .mod });
 
-    try std.testing.expectEqualSlices(i32, &.{-1}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = -1 }}, interp.stack.items);
 }
 
 test "mod operation with division by zero" {
@@ -240,8 +320,8 @@ test "mod operation with division by zero" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 5 });
-    try interp.eval(.{ .num = 0 });
+    try interp.eval(.{ .int = 5 });
+    try interp.eval(.{ .int = 0 });
 
     try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .mod }));
 }
@@ -252,22 +332,34 @@ test "neg operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 5 });
+    try interp.eval(.{ .int = 5 });
     try interp.eval(.{ .op = .neg });
 
-    try std.testing.expectEqualSlices(i32, &.{-5}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = -5 }}, interp.stack.items);
 }
 
-test "abs operation" {
+test "abs operation on negative" {
     var buf: [32]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = -5 });
+    try interp.eval(.{ .int = -5 });
     try interp.eval(.{ .op = .abs });
 
-    try std.testing.expectEqualSlices(i32, &.{5}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 5 }}, interp.stack.items);
+}
+
+test "abs operation on positive" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .int = 7 });
+    try interp.eval(.{ .op = .abs });
+
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 7 }}, interp.stack.items);
 }
 
 test "min operation" {
@@ -276,11 +368,11 @@ test "min operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 5 });
-    try interp.eval(.{ .num = 2 });
+    try interp.eval(.{ .int = 5 });
+    try interp.eval(.{ .int = 2 });
     try interp.eval(.{ .op = .min });
 
-    try std.testing.expectEqualSlices(i32, &.{2}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 2 }}, interp.stack.items);
 }
 
 test "max operation" {
@@ -289,11 +381,11 @@ test "max operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 3 });
-    try interp.eval(.{ .num = 9 });
+    try interp.eval(.{ .int = 3 });
+    try interp.eval(.{ .int = 9 });
     try interp.eval(.{ .op = .max });
 
-    try std.testing.expectEqualSlices(i32, &.{9}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 9 }}, interp.stack.items);
 }
 
 test "dup operation" {
@@ -302,10 +394,10 @@ test "dup operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 7 });
+    try interp.eval(.{ .int = 7 });
     try interp.eval(.{ .op = .dup });
 
-    try std.testing.expectEqualSlices(i32, &.{ 7, 7 }, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{ .{ .int = 7 }, .{ .int = 7 } }, interp.stack.items);
 }
 
 test "swap operation" {
@@ -314,11 +406,11 @@ test "swap operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 1 });
-    try interp.eval(.{ .num = 2 });
+    try interp.eval(.{ .int = 1 });
+    try interp.eval(.{ .int = 2 });
     try interp.eval(.{ .op = .swap });
 
-    try std.testing.expectEqualSlices(i32, &.{ 2, 1 }, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{ .{ .int = 2 }, .{ .int = 1 } }, interp.stack.items);
 }
 
 test "over operation" {
@@ -327,11 +419,11 @@ test "over operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 1 });
-    try interp.eval(.{ .num = 2 });
+    try interp.eval(.{ .int = 1 });
+    try interp.eval(.{ .int = 2 });
     try interp.eval(.{ .op = .over });
 
-    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 1 }, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 1 } }, interp.stack.items);
 }
 
 test "drop operation" {
@@ -340,11 +432,11 @@ test "drop operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 1 });
-    try interp.eval(.{ .num = 2 });
+    try interp.eval(.{ .int = 1 });
+    try interp.eval(.{ .int = 2 });
     try interp.eval(.{ .op = .drop });
 
-    try std.testing.expectEqualSlices(i32, &.{1}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 1 }}, interp.stack.items);
 }
 
 test "clear operation" {
@@ -353,9 +445,9 @@ test "clear operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 1 });
-    try interp.eval(.{ .num = 2 });
-    try interp.eval(.{ .num = 3 });
+    try interp.eval(.{ .int = 1 });
+    try interp.eval(.{ .int = 2 });
+    try interp.eval(.{ .int = 3 });
     try interp.eval(.{ .op = .clear });
 
     try std.testing.expectEqual(0, interp.stack.items.len);
@@ -367,7 +459,7 @@ test "print operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 5 });
+    try interp.eval(.{ .int = 5 });
     try interp.eval(.{ .op = .print });
 
     try std.testing.expectEqualStrings("> 5\n", w.buffer[0..w.end]);
@@ -380,11 +472,11 @@ test "peek operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 5 });
+    try interp.eval(.{ .int = 5 });
     try interp.eval(.{ .op = .peek });
 
     try std.testing.expectEqualStrings("| 5\n", w.buffer[0..w.end]);
-    try std.testing.expectEqualSlices(i32, &.{5}, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{.{ .int = 5 }}, interp.stack.items);
 }
 
 test "stack operation" {
@@ -393,12 +485,12 @@ test "stack operation" {
     var interp = Interpreter.init(std.testing.allocator, &w);
     defer interp.stack.deinit(std.testing.allocator);
 
-    try interp.eval(.{ .num = 1 });
-    try interp.eval(.{ .num = 2 });
+    try interp.eval(.{ .int = 1 });
+    try interp.eval(.{ .int = 2 });
     try interp.eval(.{ .op = .stack });
 
     try std.testing.expectEqualStrings("| 2\n| 1\n", w.buffer[0..w.end]);
-    try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, interp.stack.items);
+    try std.testing.expectEqualSlices(Value, &.{ .{ .int = 1 }, .{ .int = 2 } }, interp.stack.items);
 }
 
 test "quit operation" {
@@ -408,4 +500,166 @@ test "quit operation" {
     defer interp.stack.deinit(std.testing.allocator);
 
     try std.testing.expectError(EvalError.Quit, interp.eval(.{ .op = .quit }));
+}
+
+test "add operation with mixed int and float" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .int = 2 });
+    try interp.eval(.{ .float = 3.5 });
+    try interp.eval(.{ .op = .add });
+
+    try std.testing.expectEqualSlices(Value, &.{.{ .float = 5.5 }}, interp.stack.items);
+}
+
+test "sub operation with mixed int and float" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = 10.5 });
+    try interp.eval(.{ .int = 3 });
+    try interp.eval(.{ .op = .sub });
+
+    try std.testing.expectEqualSlices(Value, &.{.{ .float = 7.5 }}, interp.stack.items);
+}
+
+test "mul operation with mixed int and float" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = 2.5 });
+    try interp.eval(.{ .int = 4 });
+    try interp.eval(.{ .op = .mul });
+
+    try std.testing.expectEqualSlices(Value, &.{.{ .float = 10.0 }}, interp.stack.items);
+}
+
+test "div operation with mixed int and float doesn't truncate" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = 7.0 });
+    try interp.eval(.{ .int = 2 });
+    try interp.eval(.{ .op = .div });
+
+    try std.testing.expectEqualSlices(Value, &.{.{ .float = 3.5 }}, interp.stack.items);
+}
+
+test "mod operation with mixed int and float" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = 7.5 });
+    try interp.eval(.{ .int = 2 });
+    try interp.eval(.{ .op = .mod });
+
+    try std.testing.expectEqualSlices(Value, &.{.{ .float = 1.5 }}, interp.stack.items);
+}
+
+test "div operation with float division by zero" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = 5.0 });
+    try interp.eval(.{ .float = 0.0 });
+
+    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .div }));
+}
+
+test "mod operation with float division by zero" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = 5.0 });
+    try interp.eval(.{ .float = 0.0 });
+
+    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .mod }));
+}
+
+test "mul operation with float overflow" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = std.math.floatMax(f64) });
+    try interp.eval(.{ .float = 2.0 });
+
+    try std.testing.expectError(EvalError.InvalidFloat, interp.eval(.{ .op = .mul }));
+}
+
+test "print operation with float" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = 2.5 });
+    try interp.eval(.{ .op = .print });
+
+    try std.testing.expectEqualStrings("> 2.5\n", w.buffer[0..w.end]);
+    try std.testing.expectEqual(0, interp.stack.items.len);
+}
+
+test "peek operation with float" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .float = 2.5 });
+    try interp.eval(.{ .op = .peek });
+
+    try std.testing.expectEqualStrings("| 2.5\n", w.buffer[0..w.end]);
+    try std.testing.expectEqualSlices(Value, &.{.{ .float = 2.5 }}, interp.stack.items);
+}
+
+test "stack operation with mixed types" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.eval(.{ .int = 1 });
+    try interp.eval(.{ .float = 2.5 });
+    try interp.eval(.{ .op = .stack });
+
+    try std.testing.expectEqualStrings("| 2.5\n| 1\n", w.buffer[0..w.end]);
+    try std.testing.expectEqualSlices(Value, &.{ .{ .int = 1 }, .{ .float = 2.5 } }, interp.stack.items);
+}
+
+test "Value.format" {
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+
+    try w.print("{f} {f} {f}", .{ Value{ .int = 5 }, Value{ .float = 2.5 }, Value{ .float = 5.0 } });
+
+    try std.testing.expectEqualStrings("5 2.5 5.0", w.buffer[0..w.end]);
+}
+
+test "arithmetic errors on non-numeric value" {
+    var buf: [32]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var interp = Interpreter.init(std.testing.allocator, &w);
+    defer interp.stack.deinit(std.testing.allocator);
+
+    try interp.stack.append(interp.arena, .{ .bool = true });
+    try interp.stack.append(interp.arena, .{ .int = 1 });
+
+    try std.testing.expectError(EvalError.ArithmeticWithNoNumber, interp.eval(.{ .op = .add }));
 }

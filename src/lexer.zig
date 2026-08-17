@@ -7,7 +7,7 @@ const tok = @import("./token.zig");
 const Token = tok.Token;
 const OpType = tok.OpType;
 
-pub const LexError = error{ NotKeyword, UnsupportedCharacter, Overflow, NegativeWithoutNumber } || Allocator.Error;
+pub const LexError = error{ NotKeyword, UnsupportedCharacter, Overflow, NegativeWithoutNumber, DecimalPointWithoutNumber } || Allocator.Error;
 
 pub const TokenList = Aligned(Token, null);
 
@@ -58,9 +58,25 @@ pub const Lexer = struct {
                     self.index += 1;
                 }
 
-                const num = try parseToInt(text[start_index..self.index]);
+                // floats
+                if (!self.isAtEnd() and self.peekAt(0) == '.') {
+                    self.index += 1;
+                    if (self.isAtEnd() or !std.ascii.isDigit(self.peekAt(0))) return LexError.DecimalPointWithoutNumber;
 
-                try token_list.append(self.arena, .{ .num = num });
+                    while (!self.isAtEnd() and std.ascii.isDigit(self.peekAt(0))) {
+                        self.index += 1;
+                    }
+                    const num = std.fmt.parseFloat(f64, text[start_index..self.index]) catch unreachable;
+
+                    try token_list.append(self.arena, .{ .float = num });
+                } else {
+                    const num = std.fmt.parseInt(i32, text[start_index..self.index], 10) catch |err| switch (err) {
+                        error.InvalidCharacter => unreachable,
+                        error.Overflow => return LexError.Overflow,
+                    };
+
+                    try token_list.append(self.arena, .{ .int = num });
+                }
 
                 continue :state .start;
             },
@@ -106,61 +122,14 @@ pub const Lexer = struct {
     }
 };
 
-// parses string in form -?[0-9]+ to an i32 with checks for overflow and underflow
-// starts by building a negative version of the actual number and then corrects in the end
-// with a sign flip since more numbers can be stored once signed integer goes below 0
-pub fn parseToInt(str: []const u8) LexError!i32 {
-    const sign: i32 = if (str[0] == '-') -1 else 1;
-    const trimmed: []const u8 = if (sign == -1) str[1..] else str;
-
-    // what stores the final result
-    var n: i32 = 0;
-
-    for (trimmed) |digit| {
-        if (n < std.math.minInt(i32) / 10 or (n == std.math.minInt(i32) / 10 and digit - '0' > 8))
-            return LexError.Overflow;
-        n = 10 * n - (digit - '0');
-    }
-
-    if (sign == 1 and n == std.math.minInt(i32)) return LexError.Overflow;
-
-    // negating n would make minInt(i32) become an overflow error so the - was moved to sign in order
-    // to avoid erroring on good value
-    return -sign * n;
-}
-
-test "parsing int #1" {
-    try std.testing.expect(try parseToInt("2147483647") == 2147483647);
-}
-
-test "parsing int #2" {
-    try std.testing.expect(parseToInt("2147483648") catch |err| err == LexError.Overflow);
-}
-
-test "parsing int #3" {
-    try std.testing.expect(try parseToInt("-2147483648") == -2147483648);
-}
-
-test "parsing int #4" {
-    try std.testing.expect(parseToInt("-2147483649") catch |err| err == LexError.Overflow);
-}
-
-test "parsing int #5" {
-    try std.testing.expect(try parseToInt("-42") == -42);
-}
-
-test "parsing int #6" {
-    try std.testing.expect(parseToInt("10010130000000000") catch |err| err == LexError.Overflow);
-}
-
 test "lexer (numbers and add keyword)" {
     var lexer = Lexer{ .arena = std.testing.allocator };
     var token_list = try lexer.lex("3 4 add");
     defer token_list.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 3), token_list.items.len);
-    try std.testing.expectEqual(Token{ .num = 3 }, token_list.items[0]);
-    try std.testing.expectEqual(Token{ .num = 4 }, token_list.items[1]);
+    try std.testing.expectEqual(3, token_list.items.len);
+    try std.testing.expectEqual(Token{ .int = 3 }, token_list.items[0]);
+    try std.testing.expectEqual(Token{ .int = 4 }, token_list.items[1]);
     try std.testing.expectEqual(Token{ .op = .add }, token_list.items[2]);
 }
 
@@ -169,8 +138,8 @@ test "lexer (comment with no trailing newline doesn't run off the buffer)" {
     var token_list = try lexer.lex("-5 -- rest is ignored");
     defer token_list.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), token_list.items.len);
-    try std.testing.expectEqual(Token{ .num = -5 }, token_list.items[0]);
+    try std.testing.expectEqual(1, token_list.items.len);
+    try std.testing.expectEqual(Token{ .int = -5 }, token_list.items[0]);
 }
 
 test "lexer (errors on bad input)" {
@@ -179,4 +148,39 @@ test "lexer (errors on bad input)" {
     try std.testing.expectError(LexError.NegativeWithoutNumber, lexer.lex("-"));
     try std.testing.expectError(LexError.UnsupportedCharacter, lexer.lex("$"));
     try std.testing.expectError(LexError.NotKeyword, lexer.lex("foo"));
+}
+
+test "lexer (float literal)" {
+    var lexer = Lexer{ .arena = std.testing.allocator };
+    var token_list = try lexer.lex("2.5");
+    defer token_list.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(1, token_list.items.len);
+    try std.testing.expectEqual(Token{ .float = 2.5 }, token_list.items[0]);
+}
+
+test "lexer (negative float literal)" {
+    var lexer = Lexer{ .arena = std.testing.allocator };
+    var token_list = try lexer.lex("-2.5");
+    defer token_list.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(1, token_list.items.len);
+    try std.testing.expectEqual(Token{ .float = -2.5 }, token_list.items[0]);
+}
+
+test "lexer (mixed int and float)" {
+    var lexer = Lexer{ .arena = std.testing.allocator };
+    var token_list = try lexer.lex("3 4.5 add");
+    defer token_list.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(3, token_list.items.len);
+    try std.testing.expectEqual(Token{ .int = 3 }, token_list.items[0]);
+    try std.testing.expectEqual(Token{ .float = 4.5 }, token_list.items[1]);
+    try std.testing.expectEqual(Token{ .op = .add }, token_list.items[2]);
+}
+
+test "lexer (errors on decimal point without digits)" {
+    var lexer = Lexer{ .arena = std.testing.allocator };
+
+    try std.testing.expectError(LexError.DecimalPointWithoutNumber, lexer.lex("3."));
 }

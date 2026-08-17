@@ -23,6 +23,8 @@ pub const OpType = enum {
 };
 
 pub const Token = union(enum) {
-    num: i32,
+    int: i32,
+    float: f64,
+    bool: bool,
     op: OpType,
 };
