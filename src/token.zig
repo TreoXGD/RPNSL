@@ -1,10 +1,10 @@
 // INFO: try to not forget to update info in help command when changing operations
 pub const OpType = enum {
-    add,
-    sub,
-    mul,
-    div,
-    mod,
+    plus,
+    minus,
+    star,
+    slash,
+    percent,
     neg,
     abs,
     min,

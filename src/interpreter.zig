@@ -53,7 +53,7 @@ pub const Interpreter = struct {
             .op => |op| {
                 switch (op) {
                     // binary arithmetic operations
-                    .add, .sub, .mul, .div, .mod, .min, .max => {
+                    .plus, .minus, .star, .slash, .percent, .min, .max => {
                         const rhs = try isNumber(try self.popOrError());
                         const lhs = try isNumber(try self.popOrError());
 
@@ -115,13 +115,13 @@ pub const Interpreter = struct {
                     .quit => return EvalError.Quit,
                     .help => {
                         const help_commands =
-                            \\add - pops 2, pushes their sum
-                            \\sub - pops 2, pushes their second-from-top minus top
-                            \\mul - pops 2, pushes their product
-                            \\div - pops 2, pushes their second-from-top over top and errors if top is 0
-                            \\mod - pops 2, pushes remainder of second-from-top over top and errors if top is 0
+                            \\+ - pops 2, pushes their sum
+                            \\- - pops 2, pushes their second-from-top minus top
+                            \\* - pops 2, pushes their product
+                            \\/ - pops 2, pushes their second-from-top over top and errors if top is 0
+                            \\% - pops 2, pushes remainder of second-from-top over top and errors if top is 0
                             \\neg - pops 1, pushes its negations
-                            \\abs - pops 2, pushes its absolute value
+                            \\abs - pops 1, pushes its absolute value
                             \\min - pops 2, pushes smaller value
                             \\max - pops 2, pushes bigger value
                             \\dup - pushes a copy of the top
@@ -184,26 +184,26 @@ pub const Interpreter = struct {
     // finds the result of 'lhs op rhs' expression and returns it with same type as the arguments
     fn numOp(T: type, op: OpType, lhs: T, rhs: T) EvalError!T {
         return blk: switch (op) {
-            .add => if (T == i32) {
+            .plus => if (T == i32) {
                 const res = @addWithOverflow(lhs, rhs);
                 if (res[1] != 0) return EvalError.OverflowOnCommand;
                 break :blk res[0];
             } else lhs + rhs,
-            .sub => if (T == i32) {
+            .minus => if (T == i32) {
                 const res = @subWithOverflow(lhs, rhs);
                 if (res[1] != 0) return EvalError.OverflowOnCommand;
                 break :blk res[0];
             } else lhs - rhs,
-            .mul => if (T == i32) {
+            .star => if (T == i32) {
                 const res = @mulWithOverflow(lhs, rhs);
                 if (res[1] != 0) return EvalError.OverflowOnCommand;
                 break :blk res[0];
             } else lhs * rhs,
-            .div => {
+            .slash => {
                 if (rhs == 0) return EvalError.DivisionByZero;
                 break :blk if (T == i32) @divTrunc(lhs, rhs) else lhs / rhs;
             },
-            .mod => {
+            .percent => {
                 if (rhs == 0) return EvalError.DivisionByZero;
                 break :blk @rem(lhs, rhs);
             },
@@ -245,7 +245,7 @@ test "add operation" {
 
     try interp.eval(.{ .int = 2 });
     try interp.eval(.{ .int = 3 });
-    try interp.eval(.{ .op = .add });
+    try interp.eval(.{ .op = .plus });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .int = 5 }}, interp.stack.items);
 }
@@ -258,7 +258,7 @@ test "sub operation" {
 
     try interp.eval(.{ .int = 10 });
     try interp.eval(.{ .int = 3 });
-    try interp.eval(.{ .op = .sub });
+    try interp.eval(.{ .op = .minus });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .int = 7 }}, interp.stack.items);
 }
@@ -271,7 +271,7 @@ test "mul operation" {
 
     try interp.eval(.{ .int = 4 });
     try interp.eval(.{ .int = 5 });
-    try interp.eval(.{ .op = .mul });
+    try interp.eval(.{ .op = .star });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .int = 20 }}, interp.stack.items);
 }
@@ -284,7 +284,7 @@ test "div operation" {
 
     try interp.eval(.{ .int = 20 });
     try interp.eval(.{ .int = 4 });
-    try interp.eval(.{ .op = .div });
+    try interp.eval(.{ .op = .slash });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .int = 5 }}, interp.stack.items);
 }
@@ -298,7 +298,7 @@ test "div operation with division by zero" {
     try interp.eval(.{ .int = 5 });
     try interp.eval(.{ .int = 0 });
 
-    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .div }));
+    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .slash }));
 }
 
 test "mod operation" {
@@ -309,7 +309,7 @@ test "mod operation" {
 
     try interp.eval(.{ .int = -7 });
     try interp.eval(.{ .int = 3 });
-    try interp.eval(.{ .op = .mod });
+    try interp.eval(.{ .op = .percent });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .int = -1 }}, interp.stack.items);
 }
@@ -323,7 +323,7 @@ test "mod operation with division by zero" {
     try interp.eval(.{ .int = 5 });
     try interp.eval(.{ .int = 0 });
 
-    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .mod }));
+    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .percent }));
 }
 
 test "neg operation" {
@@ -510,7 +510,7 @@ test "add operation with mixed int and float" {
 
     try interp.eval(.{ .int = 2 });
     try interp.eval(.{ .float = 3.5 });
-    try interp.eval(.{ .op = .add });
+    try interp.eval(.{ .op = .plus });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .float = 5.5 }}, interp.stack.items);
 }
@@ -523,7 +523,7 @@ test "sub operation with mixed int and float" {
 
     try interp.eval(.{ .float = 10.5 });
     try interp.eval(.{ .int = 3 });
-    try interp.eval(.{ .op = .sub });
+    try interp.eval(.{ .op = .minus });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .float = 7.5 }}, interp.stack.items);
 }
@@ -536,7 +536,7 @@ test "mul operation with mixed int and float" {
 
     try interp.eval(.{ .float = 2.5 });
     try interp.eval(.{ .int = 4 });
-    try interp.eval(.{ .op = .mul });
+    try interp.eval(.{ .op = .star });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .float = 10.0 }}, interp.stack.items);
 }
@@ -549,7 +549,7 @@ test "div operation with mixed int and float doesn't truncate" {
 
     try interp.eval(.{ .float = 7.0 });
     try interp.eval(.{ .int = 2 });
-    try interp.eval(.{ .op = .div });
+    try interp.eval(.{ .op = .slash });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .float = 3.5 }}, interp.stack.items);
 }
@@ -562,7 +562,7 @@ test "mod operation with mixed int and float" {
 
     try interp.eval(.{ .float = 7.5 });
     try interp.eval(.{ .int = 2 });
-    try interp.eval(.{ .op = .mod });
+    try interp.eval(.{ .op = .percent });
 
     try std.testing.expectEqualSlices(Value, &.{.{ .float = 1.5 }}, interp.stack.items);
 }
@@ -576,7 +576,7 @@ test "div operation with float division by zero" {
     try interp.eval(.{ .float = 5.0 });
     try interp.eval(.{ .float = 0.0 });
 
-    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .div }));
+    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .slash }));
 }
 
 test "mod operation with float division by zero" {
@@ -588,7 +588,7 @@ test "mod operation with float division by zero" {
     try interp.eval(.{ .float = 5.0 });
     try interp.eval(.{ .float = 0.0 });
 
-    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .mod }));
+    try std.testing.expectError(EvalError.DivisionByZero, interp.eval(.{ .op = .percent }));
 }
 
 test "mul operation with float overflow" {
@@ -600,7 +600,7 @@ test "mul operation with float overflow" {
     try interp.eval(.{ .float = std.math.floatMax(f64) });
     try interp.eval(.{ .float = 2.0 });
 
-    try std.testing.expectError(EvalError.InvalidFloat, interp.eval(.{ .op = .mul }));
+    try std.testing.expectError(EvalError.InvalidFloat, interp.eval(.{ .op = .star }));
 }
 
 test "print operation with float" {
@@ -661,5 +661,5 @@ test "arithmetic errors on non-numeric value" {
     try interp.stack.append(interp.arena, .{ .bool = true });
     try interp.stack.append(interp.arena, .{ .int = 1 });
 
-    try std.testing.expectError(EvalError.ArithmeticWithNoNumber, interp.eval(.{ .op = .add }));
+    try std.testing.expectError(EvalError.ArithmeticWithNoNumber, interp.eval(.{ .op = .plus }));
 }

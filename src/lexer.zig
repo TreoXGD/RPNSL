@@ -7,7 +7,7 @@ const tok = @import("./token.zig");
 const Token = tok.Token;
 const OpType = tok.OpType;
 
-pub const LexError = error{ NotKeyword, UnsupportedCharacter, Overflow, NegativeWithoutNumber, DecimalPointWithoutNumber } || Allocator.Error;
+pub const LexError = error{ NotKeyword, UnsupportedCharacter, Overflow, DecimalPointWithoutNumber } || Allocator.Error;
 
 pub const TokenList = Aligned(Token, null);
 
@@ -20,6 +20,7 @@ pub const Lexer = struct {
         start,
         num,
         ident,
+        op,
         end,
     };
 
@@ -35,21 +36,34 @@ pub const Lexer = struct {
                     '0'...'9' => {
                         continue :state .num;
                     },
+                    '+', '*', '/', '%' => continue :state .op,
                     '-' => {
-                        if (self.isAtEnd()) return LexError.NegativeWithoutNumber;
-                        // line comment --
-                        if (self.peekAt(0) == '-') {
-                            while (!self.isAtEnd() and self.peekAt(0) != '\n') self.index += 1;
-                            continue :state .start;
-                        }
-                        // negative number
-                        if (!std.ascii.isDigit(self.peekAt(0))) return LexError.NegativeWithoutNumber;
-                        continue :state .num;
+                        if (std.ascii.isDigit(self.peekAt(0))) continue :state .num;
+
+                        continue :state .op;
+                    },
+                    ';' => {
+                        while (!self.isAtEnd() and self.peekAt(0) != '\n') self.index += 1;
+                        continue :state .start;
                     },
                     ' ', '\t', '\r', '\n' => continue :state .start,
                     'a'...'z' => continue :state .ident,
                     else => return LexError.UnsupportedCharacter,
                 }
+            },
+            .op => {
+                const op: OpType = switch (self.text[self.index - 1]) {
+                    '+' => .plus,
+                    '-' => .minus,
+                    '*' => .star,
+                    '/' => .slash,
+                    '%' => .percent,
+                    else => unreachable,
+                };
+
+                try token_list.append(self.arena, .{ .op = op });
+
+                continue :state .start;
             },
             .num => {
                 // start_index is index - 1 in order to include the '-' sign for parsing and bound checking
@@ -124,18 +138,18 @@ pub const Lexer = struct {
 
 test "lexer (numbers and add keyword)" {
     var lexer = Lexer{ .arena = std.testing.allocator };
-    var token_list = try lexer.lex("3 4 add");
+    var token_list = try lexer.lex("3 4 +");
     defer token_list.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(3, token_list.items.len);
     try std.testing.expectEqual(Token{ .int = 3 }, token_list.items[0]);
     try std.testing.expectEqual(Token{ .int = 4 }, token_list.items[1]);
-    try std.testing.expectEqual(Token{ .op = .add }, token_list.items[2]);
+    try std.testing.expectEqual(Token{ .op = .plus }, token_list.items[2]);
 }
 
 test "lexer (comment with no trailing newline doesn't run off the buffer)" {
     var lexer = Lexer{ .arena = std.testing.allocator };
-    var token_list = try lexer.lex("-5 -- rest is ignored");
+    var token_list = try lexer.lex("-5 ; rest is ignored");
     defer token_list.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(1, token_list.items.len);
@@ -145,7 +159,6 @@ test "lexer (comment with no trailing newline doesn't run off the buffer)" {
 test "lexer (errors on bad input)" {
     var lexer = Lexer{ .arena = std.testing.allocator };
 
-    try std.testing.expectError(LexError.NegativeWithoutNumber, lexer.lex("-"));
     try std.testing.expectError(LexError.UnsupportedCharacter, lexer.lex("$"));
     try std.testing.expectError(LexError.NotKeyword, lexer.lex("foo"));
 }
@@ -170,13 +183,13 @@ test "lexer (negative float literal)" {
 
 test "lexer (mixed int and float)" {
     var lexer = Lexer{ .arena = std.testing.allocator };
-    var token_list = try lexer.lex("3 4.5 add");
+    var token_list = try lexer.lex("3 4.5 +");
     defer token_list.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(3, token_list.items.len);
     try std.testing.expectEqual(Token{ .int = 3 }, token_list.items[0]);
     try std.testing.expectEqual(Token{ .float = 4.5 }, token_list.items[1]);
-    try std.testing.expectEqual(Token{ .op = .add }, token_list.items[2]);
+    try std.testing.expectEqual(Token{ .op = .plus }, token_list.items[2]);
 }
 
 test "lexer (errors on decimal point without digits)" {

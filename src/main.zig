@@ -43,7 +43,6 @@ fn repl(init: std.process.Init) !void {
                 LexError.NotKeyword => stderr.writeAll("The used identifier is not an already used keyword.\n"),
                 LexError.Overflow => stderr.writeAll("The number was too big to store.\n"),
                 LexError.OutOfMemory => stderr.writeAll("The token list ran out of memory.\n"),
-                LexError.NegativeWithoutNumber => stderr.writeAll("The '-' symbol must be immediately followed by a number.\n"),
                 LexError.DecimalPointWithoutNumber => stderr.writeAll("The floating number must have at least 1 number after '.'\n"),
             };
             try stderr.flush();
@@ -51,6 +50,7 @@ fn repl(init: std.process.Init) !void {
         };
         defer token_list.deinit(arena);
 
+        std.debug.print("{any}\n", .{token_list.items});
         // evaluating
         for (token_list.items) |token| {
             interpreter.eval(token) catch |err| {
